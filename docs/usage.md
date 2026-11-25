@@ -56,6 +56,57 @@ Weights enter the Bayesian ridge fit (as fractional observation counts) and
 the leverage regularization of the POPS corrections. Points of zero weight do
 not contribute to the POPS posterior.
 
+### Several targets
+
+Targets that share one design matrix are fitted jointly by passing `y` of
+shape `(n_samples, n_targets)`, for example the rows of a linear dynamical
+model `z_next = M @ phi(z, u)`:
+
+```python
+model = POPSRegression().fit(Phi, Z_next)   # Z_next: (n_samples, n_targets)
+model.coef_                                 # (n_targets, n_features)
+```
+
+The targets share the prior and the noise model: `alpha_` and `lambda_` are
+pooled over the targets (one evidence maximization for all of them), so every
+target has the same metric `A = X^T X + (lambda_ / alpha_) I`. The pointwise
+correction of training point `i` then moves all targets together. It is the
+smallest change of all coefficients, in the metric `I ⊗ A`, after which the
+model fits every target of point `i`, the rank-one matrix
+`D_i = e_i (A⁻¹ x_i)^T / h_i` with the residual vector `e_i`. The POPS
+posterior is one hypercube over the stacked coefficients `vec(coef_)`
+(target-major: entry `j * n_features + f` is coefficient `f` of target `j`),
+not a product of per-target boxes.
+
+Every output of the model follows this layout: `pointwise_corrections_` has
+one row `vec(D_i)` per training point, `posterior_samples_`,
+`misspecification_sigma_` and `hypercube_support_` are over `vec(coef_)`, and
+`predict` returns arrays of shape `(n_samples, n_targets)`. `sigma_`, the
+epistemic covariance, is shared by the targets, which are independent under
+it. The stacked corrections are generated in blocks, so the
+`n_samples x (n_targets * n_features)` correction matrix is only formed when
+`pointwise_corrections_` is accessed (or for `posterior='ensemble'`). A
+one-dimensional `y`, or `y` of shape `(n_samples, 1)`, is the single-target
+fit.
+
+### Fixed ridge and mean-only fits
+
+`ridge` fixes the ratio `lambda_ / alpha_` instead of learning it by evidence
+maximization: the mean fit is then the ridge regression with this
+coefficient, and `alpha_` is the noise precision of its residuals. This is the
+way to use a ridge coefficient chosen by validation. `posterior=None` skips
+the pointwise corrections and the posterior, which makes a validation sweep
+cheap:
+
+```python
+for ridge in np.logspace(-10, 2, 13):
+    mean = POPSRegression(ridge=ridge, posterior=None).fit(X_fit, y_fit)
+    error = np.mean((mean.predict(X_val) - y_val) ** 2)
+```
+
+`include_center=True` extends the hypercube bounds to contain `coef_` (every
+lower bound at most 0, every upper bound at least 0).
+
 ## Prediction
 
 `predict` returns the mean by default. Each flag appends further arrays, in a
@@ -262,20 +313,32 @@ See [Ellipse posteriors](ellipse.md).
 
 | Attribute | Description |
 |---|---|
-| `coef_` | Regression coefficients (posterior mean) |
-| `intercept_` | Independent term; `0.0` when `fit_intercept=False` |
-| `sigma_` | Epistemic variance-covariance matrix of the weights |
+Shapes are for one target; with `n_targets` targets, every `n_features`
+below becomes `n_targets * n_features` (target-major) except in `coef_` and
+`sigma_`.
+
+| Attribute | Description |
+|---|---|
+| `coef_` | Regression coefficients (posterior mean); `(n_targets, n_features)` with several targets |
+| `intercept_` | Independent term; `0.0` when `fit_intercept=False` (an array of `n_targets` with several targets) |
+| `sigma_` | Epistemic variance-covariance matrix of the weights (of every target) |
 | `misspecification_sigma_` | Misspecification variance-covariance matrix from POPS |
 | `posterior_samples_` | POPS posterior samples, shape `(n_features, n_posterior_samples)` |
+| `hypercube_support_` | Orthonormal hypercube directions, shape `(n_features, n_modes)` |
+| `hypercube_bounds_` | Lower and upper coordinates of the hypercube along its directions |
 | `alpha_` | Estimated noise precision — fitted, but not used for prediction |
 | `lambda_` | Estimated weight precision |
 | `pointwise_corrections_` | Pointwise corrections `dθ_i`, shape `(n_samples, n_features)` |
 | `leverage_` | Leverage `h_i` of every training point |
 | `selected_` | Boolean mask of the points that entered the posterior |
-| `n_iter_` | Iterations to convergence |
+| `n_iter_` | Iterations to convergence (0 with a fixed `ridge`) |
+| `n_targets_` | Number of targets (1 for a one-dimensional `y`) |
 
 `posterior_samples_` holds weight *perturbations* around `coef_`, so a
-parameter ensemble is `coef_[:, None] + model.posterior_samples_`.
+parameter ensemble is `coef_[:, None] + model.posterior_samples_` (with
+several targets, `coef_.reshape(-1)[:, None] + model.posterior_samples_`).
+A hypercube sample is `hypercube_support_ @ nu` with `nu` inside
+`hypercube_bounds_`.
 
 ## Pipelines and model selection
 
