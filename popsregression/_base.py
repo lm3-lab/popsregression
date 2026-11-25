@@ -85,13 +85,25 @@ class BaseEstimator:
         )
 
     def score(self, X, y):
-        """Coefficient of determination of the mean prediction."""
-        y = np.asarray(y, dtype=float).ravel()
-        residual = y - np.asarray(self.predict(X))
-        total = float(np.sum((y - y.mean()) ** 2))
-        if total == 0.0:
-            return 0.0
-        return 1.0 - float(residual @ residual) / total
+        """Coefficient of determination of the mean prediction.
+
+        With several targets, the mean of the coefficients of every target.
+        """
+        y = np.asarray(y, dtype=float)
+        prediction = np.asarray(self.predict(X))
+        if y.ndim == 2 and y.shape[1] > 1:
+            return float(
+                np.mean([_r2(y[:, j], prediction[:, j]) for j in range(y.shape[1])])
+            )
+        return _r2(y.ravel(), prediction.ravel())
+
+
+def _r2(y, prediction):
+    residual = y - prediction
+    total = float(np.sum((y - y.mean()) ** 2))
+    if total == 0.0:
+        return 0.0
+    return 1.0 - float(residual @ residual) / total
 
 
 def check_is_fitted(estimator, attribute="coef_"):
@@ -127,6 +139,30 @@ def check_X_y(X, y):
         y = y[:, 0]
     if y.ndim != 1:
         raise ValueError(f"y must be one-dimensional, got shape {y.shape}.")
+    if y.shape[0] != X.shape[0]:
+        raise ValueError(
+            f"X and y have inconsistent lengths: {X.shape[0]} and {y.shape[0]}."
+        )
+    if not np.all(np.isfinite(y)):
+        raise ValueError("y contains NaN or infinite values.")
+    return X, y
+
+
+def check_X_targets(X, y):
+    """Validated ``(X, y)`` with one or several finite targets per row.
+
+    ``y`` of shape ``(n_samples,)`` or ``(n_samples, 1)`` is returned
+    one-dimensional; ``(n_samples, n_targets)`` with ``n_targets > 1`` is
+    returned two-dimensional.
+    """
+    X = check_X(X)
+    y = np.asarray(y, dtype=np.float64)
+    if y.ndim == 2 and y.shape[1] == 1:
+        y = y[:, 0]
+    if y.ndim not in (1, 2) or (y.ndim == 2 and y.shape[1] == 0):
+        raise ValueError(
+            f"y must have shape (n_samples,) or (n_samples, n_targets), got {y.shape}."
+        )
     if y.shape[0] != X.shape[0]:
         raise ValueError(
             f"X and y have inconsistent lengths: {X.shape[0]} and {y.shape[0]}."

@@ -23,84 +23,176 @@ from ._base import (
     check_sample_weight,
     check_scalar,
     check_X,
-    check_X_y,
+    check_X_targets,
 )
 from ._bayes import as_nan, bayesian_ridge, scaled_covariance
 
 _RESAMPLING = {"latin": qmc.LatinHypercube, "sobol": qmc.Sobol, "halton": qmc.Halton}
 
 
-@jax.jit
-def pointwise_corrections(X, y, weights, fit, leverage_regularization):
-    """Pointwise optimal parameter corrections with regularized leverage.
+# Largest number of entries of a block of stacked corrections held at once.
+_BLOCK_ENTRIES = 2**24
 
-    The correction of training point ``i`` is the smallest parameter move, in
-    the metric ``A = X^T W X + lambda / alpha`` of the mean fit, after which
-    the model passes through ``y_i``. In closed form it is ``e_i A^-1 x_i /
-    h_i`` with residual ``e_i`` and leverage ``h_i = x_i^T A^-1 x_i``, which
-    diverges for points of vanishing leverage. Asking instead for the
-    minimizer of ``w_i (x_i @ d - e_i)**2 / eps + d^T A d`` gives
 
-        d_i = e_i A^-1 x_i * w_i / (w_i h_i + eps),
+class _Corrections:
+    """Pointwise corrections of every target, generated in blocks of rows.
 
-    which is bounded: ``||d_i||_A <= |e_i| sqrt(w_i / eps) / 2``. ``eps`` is
+    The correction of training point ``i`` for target ``j`` is the smallest
+    parameter move, in the metric ``A = X^T W X + lambda / alpha`` of the
+    mean fit, after which the model passes through ``y_ij``. In closed form
+    it is ``e_ij A^-1 x_i / h_i`` with residual ``e_ij`` and leverage ``h_i
+    = x_i^T A^-1 x_i``, which diverges for points of vanishing leverage.
+    Asking instead for the minimizer of ``w_i (x_i @ d - e_ij)**2 / eps +
+    d^T A d`` gives
+
+        d_ij = e_ij A^-1 x_i * w_i / (w_i h_i + eps),
+
+    which is bounded: ``||d_ij||_A <= |e_ij| sqrt(w_i / eps) / 2``. ``eps`` is
     ``leverage_regularization`` times the mean (weighted) leverage, so the
     regularization is dimensionless and only acts on points far less
     informative than the typical one.
 
-    Parameters
-    ----------
-    X, y, weights : arrays of ``n_samples`` rows
-        Design, targets and non-negative sample weights.
-    fit : RidgeFit
-        The mean fit.
-    leverage_regularization : float
-        Regularization, in units of the mean leverage.
+    All targets share ``A`` (their precisions are pooled), so the
+    corrections of one point are the rank-one matrix ``e_i (A^-1 x_i)^T``
+    up to the scalar ``w_i / (w_i h_i + eps)``: the correction of point
+    ``i`` to all targets at once, ``D_i = [d_i1; ...; d_ik]``, is the
+    smallest move in the metric ``I_k (x) A`` after which the model passes
+    through every target of point ``i``. Its target-major vectorization
+    ``vec(D_i)`` is the row stored for point ``i``; with one target it is
+    ``d_i``.
 
-    Returns
-    -------
-    corrections : array of shape (n_samples, n_modes)
-        Corrections in the right singular basis ``fit.V`` of the design (an
-        orthonormal basis, so row norms are the Euclidean ``||d_i||``).
-    errors : array of shape (n_samples,)
-        Residuals of the mean fit.
-    leverage : array of shape (n_samples,)
-        Weighted leverages ``w_i h_i``.
+    Blocks are in the right singular basis ``fit.V`` of the design: a row of
+    a block holds ``n_targets`` consecutive vectors of ``n_modes``
+    coordinates.
     """
-    T = X @ fit.V
-    inverse_gram = 1.0 / (fit.S**2 + fit.lam / fit.alpha)
-    errors = y - X @ fit.coef
-    leverage = weights * jnp.sum(T * T * inverse_gram, axis=1)
-    active = weights > 0
-    mean_leverage = jnp.sum(jnp.where(active, leverage, 0.0)) / jnp.sum(active)
-    denominator = leverage + leverage_regularization * mean_leverage
-    scale = jnp.where(denominator > 0, weights * errors / denominator, 0.0)
-    return (scale[:, None] * T) * inverse_gram, errors, leverage
+
+    def __init__(self, X, Y, weights, fit, leverage_regularization):
+        self.T, self.inverse_gram, self.scale, self.leverage = _correction_factors(
+            X, Y, weights, fit, leverage_regularization
+        )
+        self.n_samples, self.n_targets = self.scale.shape
+        self.n_modes = self.T.shape[1]
+        self.rows = max(1, _BLOCK_ENTRIES // (self.n_targets * self.n_modes))
+
+    def blocks(self):
+        """``(start, stop, block)`` with ``block`` of shape ``(stop - start,
+        n_targets * n_modes)``."""
+        for start in range(0, self.n_samples, self.rows):
+            stop = min(start + self.rows, self.n_samples)
+            yield start, stop, _correction_block(
+                self.T[start:stop], self.scale[start:stop], self.inverse_gram
+            )
+
+    def in_parameters(self, basis):
+        """Every correction in parameter coordinates, ``(n_samples, n_targets *
+        n_parameters)`` (target-major)."""
+        rows = [
+            np.asarray(_to_parameters(block, basis, self.n_targets))
+            for _, _, block in self.blocks()
+        ]
+        return np.concatenate(rows, axis=0)
 
 
 @jax.jit
+def _correction_factors(X, Y, weights, fit, leverage_regularization):
+    """Singular-basis design ``T``, inverse Gram, scales ``w e / (w h + eps)``
+    and leverages ``w h`` of the pointwise corrections."""
+    T = X @ fit.V
+    inverse_gram = 1.0 / (fit.S**2 + fit.lam / fit.alpha)
+    errors = Y - X @ fit.coef.reshape(fit.coef.shape[0], -1)
+    leverage = weights * jnp.sum(T * T * inverse_gram, axis=1)
+    active = weights > 0
+    mean_leverage = jnp.sum(jnp.where(active, leverage, 0.0)) / jnp.sum(active)
+    denominator = (leverage + leverage_regularization * mean_leverage)[:, None]
+    scale = jnp.where(denominator > 0, weights[:, None] * errors / denominator, 0.0)
+    return T, inverse_gram, scale, leverage
+
+
+@jax.jit
+def _correction_block(T, scale, inverse_gram):
+    """Rows ``vec(D_i)`` of a block of points, in the singular basis."""
+    block = (scale[:, :, None] * T[:, None, :]) * inverse_gram
+    return block.reshape(T.shape[0], -1)
+
+
+def _to_parameters(block, basis, n_targets):
+    """Rows of a block in parameter coordinates (``basis`` per target)."""
+    n_rows = block.shape[0]
+    per_target = block.reshape(n_rows, n_targets, basis.shape[1]) @ basis.T
+    return per_target.reshape(n_rows, -1)
+
+
+@jax.jit
+def _block_norm2(block, metric):
+    """Squared Euclidean norm of every row, ``metric = basis^T basis``."""
+    rows = block.reshape(block.shape[0], -1, metric.shape[0])
+    return jnp.sum((rows @ metric) * rows, axis=(1, 2))
+
+
+@jax.jit
+def _block_gram(block, keep):
+    kept = jnp.where(keep[:, None], block, 0.0)
+    return kept.T @ kept
+
+
+@jax.jit
+def _block_projection(block, keep, directions):
+    """Coordinates of the kept rows along ``directions`` (NaN elsewhere)."""
+    return jnp.where(keep[:, None], block @ directions, jnp.nan)
+
+
 def _select_and_bound(corrections, basis, active, threshold, clipping):
     """Prune negligible corrections, then fit the PCA-aligned box.
 
-    ``corrections @ basis.T`` are the corrections ``d_i`` in parameter
-    coordinates. Points are kept when their Euclidean norm ``||d_i||`` is at
-    least ``threshold`` times the root-mean-square norm: these are the rows
-    that determine the singular decomposition of the correction matrix.
+    The corrections are the rows ``vec(D_i)`` of :class:`_Corrections`; in
+    parameter coordinates every target block is mapped by ``basis``. Points
+    are kept when their Euclidean norm ``||vec(D_i)||`` is at least
+    ``threshold`` times the root-mean-square norm: these are the rows that
+    determine the singular decomposition of the correction matrix.
 
     Returns the selection mask, the eigenvalues and eigenvectors (in
-    parameter coordinates) of the pruned second-moment matrix and the box
-    bounds along every eigenvector.
+    parameter coordinates, target-major) of the pruned second-moment matrix
+    and the box bounds along every eigenvector.
     """
-    norm2 = jnp.sum((corrections @ (basis.T @ basis)) * corrections, axis=1)
-    mean_norm2 = jnp.sum(jnp.where(active, norm2, 0.0)) / jnp.sum(active)
+    metric = basis.T @ basis
+    norm2 = np.concatenate(
+        [
+            np.asarray(_block_norm2(block, metric))
+            for _, _, block in corrections.blocks()
+        ]
+    )
+    mean_norm2 = np.sum(np.where(active, norm2, 0.0)) / np.sum(active)
     keep = active & (norm2 >= threshold**2 * mean_norm2)
-    keep = jnp.where(jnp.any(keep), keep, active)
-    kept = jnp.where(keep[:, None], corrections, 0.0)
-    eigenvalues, eigenvectors = jnp.linalg.eigh(basis @ (kept.T @ kept) @ basis.T)
-    projected = corrections @ (basis.T @ eigenvectors)
-    projected = jnp.where(keep[:, None], projected, jnp.nan)
-    low = jnp.nanpercentile(projected, clipping, axis=0)
-    high = jnp.nanpercentile(projected, 100.0 - clipping, axis=0)
+    keep = np.where(np.any(keep), keep, active)
+
+    gram = None
+    for start, stop, block in corrections.blocks():
+        part = _block_gram(block, keep[start:stop])
+        gram = part if gram is None else gram + part
+    full_basis = (
+        basis
+        if corrections.n_targets == 1
+        else jnp.kron(jnp.eye(corrections.n_targets), basis)
+    )
+    eigenvalues, eigenvectors = jnp.linalg.eigh(full_basis @ gram @ full_basis.T)
+    directions = full_basis.T @ eigenvectors
+
+    if clipping == 0.0:
+        low = np.full(eigenvalues.shape[0], np.inf)
+        high = np.full(eigenvalues.shape[0], -np.inf)
+        for start, stop, block in corrections.blocks():
+            projected = _block_projection(block, keep[start:stop], directions)
+            low = np.fmin(low, np.asarray(jnp.nanmin(projected, axis=0)))
+            high = np.fmax(high, np.asarray(jnp.nanmax(projected, axis=0)))
+    else:
+        projected = jnp.concatenate(
+            [
+                _block_projection(block, keep[start:stop], directions)
+                for start, stop, block in corrections.blocks()
+            ]
+        )
+        low = np.asarray(jnp.nanpercentile(projected, clipping, axis=0))
+        high = np.asarray(jnp.nanpercentile(projected, 100.0 - clipping, axis=0))
     return keep, eigenvalues, eigenvectors, low, high
 
 
@@ -180,6 +272,17 @@ class POPSRegression(BaseEstimator):
     this by estimating misspecification uncertainty from pointwise optimal
     parameter sets.
 
+    Several targets that share the design, ``y`` of shape ``(n_samples,
+    n_targets)``, are fitted jointly, for example the rows of a linear
+    dynamical model ``z_next = M @ phi(z, u)``. The targets share the prior,
+    the noise model and therefore the metric ``A`` of the mean fit (their
+    precisions are pooled, or fixed by ``ridge``). The pointwise correction
+    of a training point then moves all targets together, as the smallest
+    change after which the model passes through every target of that point,
+    and the posterior is one hypercube over the stacked coefficients
+    ``vec(coef_)`` of all targets (target-major), not a product of
+    per-target hypercubes.
+
     Parameters
     ----------
     max_iter : int, default=300
@@ -215,6 +318,14 @@ class POPSRegression(BaseEstimator):
         Whether to fit an intercept. If True, a constant column is appended
         to X (rather than centering) so that the intercept participates in
         the POPS posterior estimation.
+
+    ridge : float, default=None
+        Fixed ratio ``lambda_ / alpha_`` of the mean fit, which is then the
+        ridge regression ``argmin ||y - X coef||^2 + ridge ||coef||^2`` (with
+        ``prior_precision``, ``ridge * coef^T Lambda coef``). No evidence
+        iteration runs: ``alpha_`` is the MacKay noise precision of the
+        residuals of this fit and ``lambda_ = ridge * alpha_``. ``None``
+        learns both precisions by evidence maximization.
 
     prior_precision : array-like of shape (n_features,) or \
             (n_features, n_features), default=None
@@ -274,11 +385,19 @@ class POPSRegression(BaseEstimator):
         ``0.0`` to keep every training point. If no point passes the
         threshold, all points are used.
 
-    posterior : {'hypercube', 'ensemble'}, default='hypercube'
+    include_center : bool, default=False
+        Extend the hypercube bounds to contain the posterior mean ``coef_``,
+        that is, the lower bound along every direction is at most 0 and the
+        upper bound at least 0.
+
+    posterior : {'hypercube', 'ensemble'} or None, default='hypercube'
         Form of the POPS parameter posterior:
 
         - ``'hypercube'``: fit an axis-aligned box in PCA space (default).
         - ``'ensemble'``: use raw pointwise corrections directly.
+        - ``None``: fit the mean only; no pointwise correction or posterior
+          is computed (``predict`` then returns only the mean and the
+          epistemic standard deviation).
 
         The uniform-ellipsoid posterior, with its empirical-Bayes and PAC
         regularizations, is :class:`~popsregression.POPSEllipseRegression`.
@@ -297,32 +416,52 @@ class POPSRegression(BaseEstimator):
 
     Attributes
     ----------
-    coef_ : ndarray of shape (n_features,)
+    In the shapes below, ``n_parameters`` is ``n_features``, plus one with
+    ``fit_intercept=True`` (the intercept is the last parameter of every
+    target). With several targets, vectors over all coefficients are
+    target-major: entry ``j * n_parameters + f`` is parameter ``f`` of
+    target ``j``.
+
+    coef_ : ndarray of shape (n_features,) or (n_targets, n_features)
         Coefficients of the regression model (posterior mean).
 
-    intercept_ : float
+    intercept_ : float or ndarray of shape (n_targets,)
         Independent term in the decision function. Set to 0.0 if
         ``fit_intercept=False``.
 
     alpha_ : float
-        Estimated precision of the noise. Not used for prediction.
+        Estimated precision of the noise (pooled over the targets). Not used
+        for prediction.
 
     lambda_ : float
         Estimated precision of the weights (the scale of the prior).
 
-    sigma_ : ndarray of shape (n_features, n_features)
-        Estimated epistemic variance-covariance matrix of the weights. If
+    sigma_ : ndarray of shape (n_parameters, n_parameters)
+        Estimated epistemic variance-covariance matrix of the weights of
+        every target; the targets are independent under it. If
         ``fit_intercept=True`` the last row and column are the intercept.
 
-    misspecification_sigma_ : ndarray of shape (n_features, n_features)
+    misspecification_sigma_ : ndarray of shape \
+            (n_targets * n_parameters, n_targets * n_parameters)
         Estimated misspecification variance-covariance matrix from POPS.
 
-    posterior_samples_ : ndarray of shape (n_features, n_posterior_samples)
+    posterior_samples_ : ndarray of shape \
+            (n_targets * n_parameters, n_posterior_samples)
         Samples from the POPS posterior, representing plausible weight
         perturbations.
 
-    pointwise_corrections_ : ndarray of shape (n_samples, n_features)
-        Pointwise corrections of every training point (lazy).
+    hypercube_support_ : ndarray of shape (n_targets * n_parameters, n_modes)
+        Orthonormal directions of the hypercube (only for
+        ``posterior='hypercube'``). A posterior sample is
+        ``hypercube_support_ @ nu`` with ``nu`` inside ``hypercube_bounds_``.
+
+    hypercube_bounds_ : tuple of two ndarrays of shape (n_modes,)
+        Lower and upper coordinates of the hypercube along every direction.
+
+    pointwise_corrections_ : ndarray of shape \
+            (n_samples, n_targets * n_parameters)
+        Pointwise corrections of every training point (lazy; computed on
+        access).
 
     leverage_ : ndarray of shape (n_samples,)
         Leverage of every training point in the mean fit.
@@ -331,7 +470,11 @@ class POPSRegression(BaseEstimator):
         Training points that entered the POPS posterior.
 
     n_iter_ : int
-        The actual number of iterations to reach convergence.
+        The actual number of iterations to reach convergence (0 with a fixed
+        ``ridge``).
+
+    n_targets_ : int
+        Number of targets; 1 for a one-dimensional ``y``.
 
     n_features_in_ : int
         Number of features seen during ``fit``.
@@ -375,6 +518,7 @@ class POPSRegression(BaseEstimator):
         alpha_init=None,
         lambda_init=None,
         fit_intercept=False,
+        ridge=None,
         prior_precision=None,
         mode_threshold=1.0e-8,
         resample_density=1.0,
@@ -382,6 +526,7 @@ class POPSRegression(BaseEstimator):
         percentile_clipping=0.0,
         leverage_regularization=1.0e-3,
         minimum_relative_correction=1.0e-2,
+        include_center=False,
         posterior="hypercube",
         random_state=None,
         minimum_relative_error="deprecated",
@@ -395,6 +540,7 @@ class POPSRegression(BaseEstimator):
         self.alpha_init = alpha_init
         self.lambda_init = lambda_init
         self.fit_intercept = fit_intercept
+        self.ridge = ridge
         self.prior_precision = prior_precision
         self.mode_threshold = mode_threshold
         self.resample_density = resample_density
@@ -402,6 +548,7 @@ class POPSRegression(BaseEstimator):
         self.percentile_clipping = percentile_clipping
         self.leverage_regularization = leverage_regularization
         self.minimum_relative_correction = minimum_relative_correction
+        self.include_center = include_center
         self.posterior = posterior
         self.random_state = random_state
         self.minimum_relative_error = minimum_relative_error
@@ -411,6 +558,8 @@ class POPSRegression(BaseEstimator):
         check_scalar("tol", self.tol, low=0.0)
         for name in ("alpha_1", "alpha_2", "lambda_1", "lambda_2"):
             check_scalar(name, getattr(self, name), low=0.0)
+        if self.ridge is not None:
+            check_scalar("ridge", self.ridge, low=0.0, low_open=True)
         check_scalar("mode_threshold", self.mode_threshold, low=0.0, low_open=True)
         check_scalar("resample_density", self.resample_density, low=0.0, low_open=True)
         check_option(
@@ -420,7 +569,8 @@ class POPSRegression(BaseEstimator):
             "percentile_clipping", self.percentile_clipping, low=0.0, high=50.0
         )
         check_scalar("leverage_regularization", self.leverage_regularization, low=0.0)
-        check_option("posterior", self.posterior, {"hypercube", "ensemble"})
+        check_option("include_center", self.include_center, {True, False})
+        check_option("posterior", self.posterior, {"hypercube", "ensemble", None})
         threshold = self.minimum_relative_correction
         if not isinstance(self.minimum_relative_error, str):
             warnings.warn(
@@ -443,8 +593,8 @@ class POPSRegression(BaseEstimator):
         X : array-like of shape (n_samples, n_features)
             Training data.
 
-        y : array-like of shape (n_samples,)
-            Target values.
+        y : array-like of shape (n_samples,) or (n_samples, n_targets)
+            Target values. Several targets are fitted jointly (see above).
 
         sample_weight : array-like of shape (n_samples,), default=None
             Individual weights for each sample. They weight the mean fit
@@ -456,17 +606,22 @@ class POPSRegression(BaseEstimator):
         self : object
             Returns the instance itself.
         """
-        X, y = check_X_y(X, y)
+        X, y = check_X_targets(X, y)
         weights = check_sample_weight(sample_weight, X.shape[0])
         self.n_features_in_ = X.shape[1]
+        self.n_targets_ = 1 if y.ndim == 1 else y.shape[1]
         if self.fit_intercept:
             X = np.hstack([X, np.ones((X.shape[0], 1))])
         coef = self._fit_hypercube(X, y, weights)
         if self.fit_intercept:
-            self.coef_, self.intercept_ = coef[:-1], float(coef[-1])
+            self.coef_ = coef[..., :-1]
+            self.intercept_ = float(coef[-1]) if y.ndim == 1 else coef[:, -1]
         else:
-            self.coef_, self.intercept_ = coef, 0.0
+            self.coef_ = coef
+            self.intercept_ = 0.0 if y.ndim == 1 else np.zeros(self.n_targets_)
 
+        if self.posterior is None:
+            return self
         if self.posterior == "ensemble":
             samples = self.pointwise_corrections_[self.selected_].T
             sigma = samples @ samples.T / samples.shape[1]
@@ -479,7 +634,8 @@ class POPSRegression(BaseEstimator):
         """Mean fit, pointwise corrections and the PCA-aligned box.
 
         ``X`` is the full design (any intercept column included). Returns
-        the coefficients of that design; no posterior samples are drawn.
+        the coefficients of that design, ``(n_parameters,)`` or
+        ``(n_targets, n_parameters)``; no posterior samples are drawn.
         """
         threshold = self._validate()
         hyper = jnp.array([self.alpha_1, self.alpha_2, self.lambda_1, self.lambda_2])
@@ -498,9 +654,22 @@ class POPSRegression(BaseEstimator):
             hyper,
             float(self.tol),
             int(self.max_iter),
+            as_nan(self.ridge),
         )
-        corrections, errors, leverage = pointwise_corrections(
-            X, y, weights, fit, float(self.leverage_regularization)
+        self.alpha_ = float(fit.alpha)
+        self.lambda_ = float(fit.lam)
+        self.n_iter_ = int(fit.n_iter)
+        covariance = np.asarray(scaled_covariance(fit)) / self.alpha_
+        self.sigma_ = _from_whitened(T, _from_whitened(T, covariance).T)
+        coef = np.asarray(fit.coef)
+        coef = _from_whitened(T, coef[:, None] if coef.ndim == 1 else coef).T
+        coef = coef[0] if y.ndim == 1 else coef
+        if self.posterior is None:
+            return coef
+
+        Y = y[:, None] if y.ndim == 1 else y
+        corrections = _Corrections(
+            X, Y, weights, fit, float(self.leverage_regularization)
         )
         basis = _from_whitened(T, np.asarray(fit.V))
         keep, eigenvalues, eigenvectors, low, high = _select_and_bound(
@@ -510,28 +679,41 @@ class POPSRegression(BaseEstimator):
             float(threshold),
             float(self.percentile_clipping),
         )
-
-        self.alpha_ = float(fit.alpha)
-        self.lambda_ = float(fit.lam)
-        self.n_iter_ = int(fit.n_iter)
-        covariance = np.asarray(scaled_covariance(fit)) / self.alpha_
-        self.sigma_ = _from_whitened(T, _from_whitened(T, covariance).T)
-        self.leverage_ = np.asarray(leverage)
+        self.leverage_ = np.asarray(corrections.leverage)
         self.selected_ = np.asarray(keep)
         self._basis = basis
         self._corrections = corrections
 
         eigenvalues = np.asarray(eigenvalues)
         modes = eigenvalues > self.mode_threshold * eigenvalues.max()
+        low, high = np.asarray(low)[modes], np.asarray(high)[modes]
+        if self.include_center:
+            low, high = np.minimum(low, 0.0), np.maximum(high, 0.0)
         self._hypercube_support = np.asarray(eigenvectors)[:, modes]
-        self._hypercube_bounds = [np.asarray(low)[modes], np.asarray(high)[modes]]
-        return _from_whitened(T, np.asarray(fit.coef)[:, None])[:, 0]
+        self._hypercube_bounds = [low, high]
+        return coef
 
     @property
     def pointwise_corrections_(self):
-        """Pointwise corrections of every training point, one per row."""
+        """Pointwise corrections of every training point, one per row.
+
+        With several targets, row ``i`` is the target-major ``vec(D_i)``.
+        """
         check_is_fitted(self, "_corrections")
-        return np.asarray(self._corrections) @ self._basis.T
+        return self._corrections.in_parameters(self._basis)
+
+    @property
+    def hypercube_support_(self):
+        """Orthonormal directions of the hypercube, one per column."""
+        check_is_fitted(self, "_hypercube_support")
+        return self._hypercube_support
+
+    @property
+    def hypercube_bounds_(self):
+        """``(lower, upper)`` coordinates of the hypercube along its directions."""
+        check_is_fitted(self, "_hypercube_bounds")
+        low, high = self._hypercube_bounds
+        return low, high
 
     def _sample_hypercube(self, size=None, resampling_method=None):
         """Sample points from the fitted POPS hypercube.
@@ -546,10 +728,11 @@ class POPSRegression(BaseEstimator):
 
         Returns
         -------
-        samples : ndarray of shape (n_features, n_samples)
+        samples : ndarray of shape (n_targets * n_parameters, n_samples)
             Resampled weight perturbations.
 
-        sigma : ndarray of shape (n_features, n_features)
+        sigma : ndarray of shape \
+                (n_targets * n_parameters, n_targets * n_parameters)
             Misspecification covariance estimated from the samples.
         """
         method = (
@@ -609,39 +792,74 @@ class POPSRegression(BaseEstimator):
 
         Returns
         -------
-        y_mean : ndarray of shape (n_samples,)
+        Every array has shape ``(n_samples,)`` for a one-dimensional ``y``
+        and ``(n_samples, n_targets)`` otherwise.
+
+        y_mean : ndarray
             Predicted mean values.
 
-        y_std : ndarray of shape (n_samples,)
+        y_std : ndarray
             Combined standard deviation. Only returned if
             ``return_std=True``.
 
-        y_max : ndarray of shape (n_samples,)
+        y_max : ndarray
             Upper bound from posterior samples. Only returned if
             ``return_bounds=True``.
 
-        y_min : ndarray of shape (n_samples,)
+        y_min : ndarray
             Lower bound from posterior samples. Only returned if
             ``return_bounds=True``.
 
-        y_epistemic_std : ndarray of shape (n_samples,)
+        y_epistemic_std : ndarray
             Epistemic-only standard deviation. Only returned if
             ``return_epistemic_std=True``.
         """
         check_is_fitted(self)
+        if self.posterior is None and (return_std or return_bounds):
+            raise ValueError(
+                "return_std and return_bounds need a POPS posterior; this model "
+                "was fitted with posterior=None."
+            )
         X = self._design(X)
-        y_mean = X[:, : self.n_features_in_] @ self.coef_ + self.intercept_
+        y_mean = X[:, : self.n_features_in_] @ self.coef_.T + self.intercept_
         result = [y_mean]
+        single = self.coef_.ndim == 1
+        n_parameters = X.shape[1]
+
+        def blocks(matrix):
+            """Per-target diagonal blocks of a target-major covariance."""
+            if single:
+                return [matrix]
+            return [
+                matrix[j * n_parameters : (j + 1) * n_parameters][
+                    :, j * n_parameters : (j + 1) * n_parameters
+                ]
+                for j in range(self.n_targets_)
+            ]
+
+        def stack(columns):
+            return columns[0] if single else np.column_stack(columns)
 
         if return_std or return_epistemic_std:
             epistemic_var = np.einsum("ij,ij->i", X @ self.sigma_, X)
+            if not single:
+                epistemic_var = np.repeat(epistemic_var[:, None], self.n_targets_, 1)
         if return_std:
-            misspecification_var = np.einsum(
-                "ij,ij->i", X @ self.misspecification_sigma_, X
+            misspecification_var = stack(
+                [
+                    np.einsum("ij,ij->i", X @ block, X)
+                    for block in blocks(self.misspecification_sigma_)
+                ]
             )
             result.append(np.sqrt(misspecification_var + epistemic_var))
         if return_bounds:
-            upper, lower = _sample_extrema(X, self.posterior_samples_)
+            samples = self.posterior_samples_
+            extrema = [
+                _sample_extrema(X, samples[j * n_parameters : (j + 1) * n_parameters])
+                for j in range(self.n_targets_)
+            ]
+            upper = stack([e[0] for e in extrema])
+            lower = stack([e[1] for e in extrema])
             result.extend([y_mean + upper, y_mean + lower])
         if return_epistemic_std:
             result.append(np.sqrt(epistemic_var))

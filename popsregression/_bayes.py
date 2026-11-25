@@ -42,33 +42,44 @@ class RidgeFit(NamedTuple):
 
 
 @jax.jit
-def _spectral_reduction(X, y):
-    """Singular basis of ``X`` and the part of ``y`` it can and cannot reach.
+def _spectral_reduction(X, Y):
+    """Singular basis of ``X`` and the part of every target it can and cannot reach.
 
-    Returns ``(S, V, u, rho2)`` with ``X = U diag(S) V^T``, ``u = U^T y`` and
-    ``rho2 = ||y - U u||^2``. For tall designs the factorization goes through
-    the triangular factor of ``[X, y]``, which neither forms the Gram matrix
-    (and so does not square the condition number) nor keeps an
-    ``(n_samples, n_features)`` orthogonal factor.
+    ``Y`` has shape ``(n_samples, n_targets)``. Returns ``(S, V, u, rho2)``
+    with ``X = U diag(S) V^T``, ``u = U^T Y`` of shape ``(n_modes,
+    n_targets)`` and ``rho2[j] = ||Y[:, j] - U u[:, j]||^2``. For tall designs
+    the factorization goes through the triangular factor of ``[X, Y]``, which
+    neither forms the Gram matrix (and so does not square the condition
+    number) nor keeps an ``(n_samples, n_features)`` orthogonal factor.
     """
     n_samples, n_features = X.shape
     if n_samples > n_features:
-        R = jnp.linalg.qr(jnp.column_stack([X, y]), mode="r")
+        R = jnp.linalg.qr(jnp.column_stack([X, Y]), mode="r")
         U, S, Vt = jnp.linalg.svd(R[:n_features, :n_features], full_matrices=False)
-        return S, Vt.T, U.T @ R[:n_features, n_features], R[n_features, n_features] ** 2
+        rho2 = jnp.sum(R[n_features:, n_features:] ** 2, axis=0)
+        return S, Vt.T, U.T @ R[:n_features, n_features:], rho2
     U, S, Vt = jnp.linalg.svd(X, full_matrices=False)
-    u = U.T @ y
-    return S, Vt.T, u, jnp.sum((y - U @ u) ** 2)
+    u = U.T @ Y
+    return S, Vt.T, u, jnp.sum((Y - U @ u) ** 2, axis=0)
 
 
 @jax.jit
-def bayesian_ridge(X, y, weights, alpha_init, lambda_init, hyper, tol, max_iter):
-    """Evidence-maximized ridge fit of ``y ~ X @ coef``.
+def bayesian_ridge(
+    X, y, weights, alpha_init, lambda_init, hyper, tol, max_iter, ridge=jnp.nan
+):
+    """Evidence-maximized ridge fit of ``y ~ X @ coef``, one or several targets.
+
+    With several targets (``y`` of shape ``(n_samples, n_targets)``) every
+    target shares the design, the prior and the noise model, so the
+    precisions ``alpha`` and ``lambda`` are pooled over the targets: the
+    MacKay updates sum the effective number of parameters, the squared
+    coefficients and the squared residuals of all targets. Every target then
+    has the same regularized Gram matrix ``A = X^T W X + lambda / alpha``.
 
     Parameters
     ----------
     X : array of shape (n_samples, n_features)
-    y : array of shape (n_samples,)
+    y : array of shape (n_samples,) or (n_samples, n_targets)
     weights : array of shape (n_samples,)
         Non-negative sample weights.
     alpha_init, lambda_init : float
@@ -80,45 +91,67 @@ def bayesian_ridge(X, y, weights, alpha_init, lambda_init, hyper, tol, max_iter)
         Stop once the coefficients move by less than ``tol`` in L1 norm.
     max_iter : int
         Maximum number of evidence iterations.
+    ridge : float, default=nan
+        Fixed ratio ``lambda / alpha``. ``nan`` learns it by evidence
+        maximization; otherwise no evidence iteration runs, the coefficients
+        are the ridge solution of this ratio, ``alpha`` is the MacKay noise
+        precision of their residuals and ``lambda = ridge * alpha``.
 
     Returns
     -------
     RidgeFit
+        ``coef`` has the shape of ``y`` with ``n_samples`` replaced by
+        ``n_features``.
     """
+    single = y.ndim == 1
+    Y = y[:, None] if single else y
+    n_targets = Y.shape[1]
     root = jnp.sqrt(weights)
-    Xw, yw = X * root[:, None], y * root
+    Xw, Yw = X * root[:, None], Y * root[:, None]
     # Weights act as fractional observation counts.
     n_effective = jnp.sum(weights)
-    S, V, u, rho2 = _spectral_reduction(Xw, yw)
+    S, V, u, rho2 = _spectral_reduction(Xw, Yw)
     eig = S * S
     alpha_1, alpha_2, lambda_1, lambda_2 = hyper
 
-    def solve(alpha, lam):
-        c = S * u / (eig + lam / alpha)
-        return V @ c, jnp.sum((u - S * c) ** 2) + rho2
+    def solve(ratio):
+        c = S[:, None] * u / (eig + ratio)[:, None]
+        return V @ c, jnp.sum((u - S[:, None] * c) ** 2) + jnp.sum(rho2)
+
+    def evidence(alpha, lam, coef, sse):
+        gamma = n_targets * jnp.sum(alpha * eig / (lam + alpha * eig))
+        lam_new = (gamma + 2.0 * lambda_1) / (jnp.sum(coef**2) + 2.0 * lambda_2)
+        alpha_new = (n_targets * n_effective - gamma + 2.0 * alpha_1) / (
+            sse + 2.0 * alpha_2
+        )
+        return alpha_new, lam_new
 
     def step(state):
         i, alpha, lam, coef_old, _ = state
-        coef, sse = solve(alpha, lam)
-        gamma = jnp.sum(alpha * eig / (lam + alpha * eig))
-        lam_new = (gamma + 2.0 * lambda_1) / (jnp.sum(coef**2) + 2.0 * lambda_2)
-        alpha_new = (n_effective - gamma + 2.0 * alpha_1) / (sse + 2.0 * alpha_2)
+        coef, sse = solve(lam / alpha)
+        alpha_new, lam_new = evidence(alpha, lam, coef, sse)
         done = (i > 0) & (jnp.sum(jnp.abs(coef_old - coef)) < tol)
         return i + 1, alpha_new, lam_new, coef, done
 
+    fixed = ~jnp.isnan(ridge)
+
     def running(state):
-        return (state[0] < max_iter) & ~state[4]
+        return (state[0] < max_iter) & ~state[4] & ~fixed
 
     eps = jnp.finfo(X.dtype).eps
-    y_var = jnp.sum(weights * (y - jnp.sum(weights * y) / n_effective) ** 2)
+    mean = jnp.sum(weights[:, None] * Y, axis=0) / n_effective
+    y_var = jnp.sum(weights[:, None] * (Y - mean) ** 2) / n_targets
     alpha0 = jnp.where(
         jnp.isnan(alpha_init), 1.0 / (y_var / n_effective + eps), alpha_init
     )
     lam0 = jnp.where(jnp.isnan(lambda_init), 1.0, lambda_init)
-    start = (0, alpha0, lam0, jnp.zeros(X.shape[1], X.dtype), False)
+    start = (0, alpha0, lam0, jnp.zeros((X.shape[1], n_targets), X.dtype), False)
     n_iter, alpha, lam, _, _ = jax.lax.while_loop(running, step, start)
-    coef, _ = solve(alpha, lam)
-    return RidgeFit(coef, alpha, lam, n_iter, V, S)
+    coef, sse = solve(jnp.where(fixed, ridge, lam / alpha))
+    alpha_fixed, _ = evidence(1.0, ridge, coef, sse)
+    alpha = jnp.where(fixed, alpha_fixed, alpha)
+    lam = jnp.where(fixed, ridge * alpha_fixed, lam)
+    return RidgeFit(coef[:, 0] if single else coef, alpha, lam, n_iter, V, S)
 
 
 @jax.jit
